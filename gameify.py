@@ -261,6 +261,8 @@ def compute_size(game):
             return sum(dir_size(b / "app" / game.app_id) for b in FLATPAK_BASES)
         if game.source == "snap" and game.app_id:
             return snap_size(game.app_id.split("_")[0])
+        if game.source not in ("native", "flatpak", "snap"):
+            return 0   # launcher-run game with no known folder: don't measure the launcher itself
         return package_size(game.launch)
     except Exception:
         return 0
@@ -476,6 +478,7 @@ def scan_lutris():
         (HOME / ".var/app/net.lutris.Lutris/data/lutris/pga.db",
          HOME / ".var/app/net.lutris.Lutris/config/lutris/games"),
     ]
+    steam_here = any((root / "steamapps").is_dir() for root in STEAM_ROOTS)
     games = []
     for db, games_dir in sources:
         if not db.is_file():
@@ -486,14 +489,20 @@ def scan_lutris():
             col = lambda c: c if c in have else "NULL"   # older Lutris lacks some columns
             rows = con.execute(
                 f"SELECT name, slug, runner, directory, {col('playtime')}, "
-                f"{col('lastplayed')}, {col('configpath')} FROM games WHERE installed = 1"
+                f"{col('lastplayed')}, {col('configpath')}, {col('service')} "
+                f"FROM games WHERE installed = 1"
             ).fetchall()
             con.close()
         except sqlite3.Error:
             continue
         flatpak = "net.lutris.Lutris" in str(db)
-        for name, slug, runner, directory, playtime, lastplayed, configpath in rows:
+        for name, slug, runner, directory, playtime, lastplayed, configpath, service in rows:
             if not name or not slug:
+                continue
+            # Games Lutris merely imported from Steam: Lutris marks the whole Steam library
+            # (even half-downloaded games) as installed. Steam knows what is really installed
+            # and those games are listed under "steam", so skip Lutris's copy.
+            if steam_here and "steam" in (runner, service):
                 continue
             if lutris_install_incomplete(games_dir, configpath):
                 continue   # half-installed or broken: Lutris can't launch it

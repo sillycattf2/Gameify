@@ -61,7 +61,7 @@ Uninstalled and half-installed games are hidden. A game is skipped when:
 - it's a Lutris game whose config file is missing or whose executable no longer exists, which is what a cancelled or failed install leaves behind,
 - it's a menu entry whose program no longer exists.
 
-If a game is installed on both Steam and Lutris, only the Steam entry is shown. Games are matched by name, ignoring case, punctuation and symbols like ® and ™.
+Steam games are only listed under Steam. Lutris also imports your Steam library and marks even half-downloaded games as installed, so gameify ignores those Lutris copies and goes by what Steam says is really installed. (If Steam isn't found on your system, they're kept.) Games are matched by name, ignoring case, punctuation and symbols like ® and ™.
 
 ## Usage
 
