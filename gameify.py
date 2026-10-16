@@ -452,31 +452,51 @@ def scan_steam():
     return games
 
 
+LUTRIS_EXE_KEY = re.compile(r"^  (?:exe|main_file):\s*(.+?)\s*$", re.M)
+
+
+def lutris_install_incomplete(games_dir, configpath):
+    """True if Lutris couldn't launch this game: its config is gone or points at a missing file."""
+    if not configpath or not games_dir.is_dir():
+        return False
+    config = games_dir / f"{configpath}.yml"
+    if not config.is_file():
+        return True
+    for value in LUTRIS_EXE_KEY.findall(read_text(config)):
+        value = value.strip("'\"")
+        if value.startswith("/") and not os.path.exists(value):
+            return True
+    return False
+
+
 def scan_lutris():
-    db_paths = [
-        HOME / ".local/share/lutris/pga.db",
-        HOME / ".var/app/net.lutris.Lutris/data/lutris/pga.db",
+    xdg_config = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+    sources = [   # (database, folder holding the per-game config files)
+        (HOME / ".local/share/lutris/pga.db", xdg_config / "lutris/games"),
+        (HOME / ".var/app/net.lutris.Lutris/data/lutris/pga.db",
+         HOME / ".var/app/net.lutris.Lutris/config/lutris/games"),
     ]
     games = []
-    for db in db_paths:
+    for db, games_dir in sources:
         if not db.is_file():
             continue
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                rows = con.execute(
-                    "SELECT name, slug, runner, directory, playtime, lastplayed "
-                    "FROM games WHERE installed = 1").fetchall()
-            except sqlite3.Error:   # older Lutris without playtime columns
-                rows = [r + (None, None) for r in con.execute(
-                    "SELECT name, slug, runner, directory FROM games WHERE installed = 1")]
+            have = {r[1] for r in con.execute("PRAGMA table_info(games)")}
+            col = lambda c: c if c in have else "NULL"   # older Lutris lacks some columns
+            rows = con.execute(
+                f"SELECT name, slug, runner, directory, {col('playtime')}, "
+                f"{col('lastplayed')}, {col('configpath')} FROM games WHERE installed = 1"
+            ).fetchall()
             con.close()
         except sqlite3.Error:
             continue
         flatpak = "net.lutris.Lutris" in str(db)
-        for name, slug, runner, directory, playtime, lastplayed in rows:
+        for name, slug, runner, directory, playtime, lastplayed, configpath in rows:
             if not name or not slug:
                 continue
+            if lutris_install_incomplete(games_dir, configpath):
+                continue   # half-installed or broken: Lutris can't launch it
             uri = f"lutris:rungame/{slug}"
             cmd = ["flatpak", "run", "net.lutris.Lutris", uri] if flatpak else ["lutris", uri]
             try:   # Lutris stores playtime as (fractional) hours
@@ -631,7 +651,8 @@ def is_missing(game):
     """True if the game's files or launcher are gone (a leftover entry from an uninstall)."""
     try:
         if game.install_dir:
-            return not Path(game.install_dir).is_dir()
+            folder = Path(game.install_dir)
+            return not folder.is_dir() or not any(folder.iterdir())
         if game.source != "native":   # launcher-run games (Lutris, Heroic...), Flatpak, Snap
             return False
         for arg in game.launch:       # native: is the program still there?
