@@ -54,6 +54,8 @@ Requires Python 3.8+ and nothing else.
 | Desktop entries | Anything in the "Game" category: native, Flatpak, Snap |
 | `/usr/games` | Classic terminal games |
 
+Uninstalled games are hidden. Anything a launcher marks as not installed is skipped, and so is leftover clutter: a game whose install folder has been deleted (or its drive unplugged), or a menu entry whose program no longer exists.
+
 If a game is installed on both Steam and Lutris, only the Steam entry is shown. Games are matched by name, ignoring case, punctuation and symbols like ® and ™.
 
 ## Usage

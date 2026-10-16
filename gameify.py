@@ -627,6 +627,26 @@ def scan_usr_games(already):
     return games
 
 
+def is_missing(game):
+    """True if the game's files or launcher are gone (a leftover entry from an uninstall)."""
+    try:
+        if game.install_dir:
+            return not Path(game.install_dir).is_dir()
+        if game.source != "native":   # launcher-run games (Lutris, Heroic...), Flatpak, Snap
+            return False
+        for arg in game.launch:       # native: is the program still there?
+            if arg == "env" or "=" in arg:
+                continue
+            if arg.startswith("/"):
+                return not os.path.exists(arg)
+            if "/" in arg:
+                return False          # relative path, can't tell - keep it
+            return shutil.which(arg) is None
+    except OSError:
+        pass
+    return False
+
+
 def normalize_name(name):
     """Loose form of a game name so 'Half-Life®' and 'half life' compare equal."""
     name = name.casefold().replace("&", "and")
@@ -653,6 +673,7 @@ def find_games():
         games += scan_usr_games(exec_names)
     except Exception:
         pass
+    games = [g for g in games if not is_missing(g)]
     games = hide_lutris_duplicates(games)
     games.sort(key=lambda g: g.name.lower())
     return games
