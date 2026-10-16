@@ -54,6 +54,8 @@ Requires Python 3.8+ and nothing else.
 | Desktop entries | Anything in the "Game" category: native, Flatpak, Snap |
 | `/usr/games` | Classic terminal games |
 
+If a game is installed on both Steam and Lutris, only the Steam entry is shown. Games are matched by name, ignoring case, punctuation and symbols like ® and ™.
+
 ## Usage
 
 ```bash

@@ -627,6 +627,19 @@ def scan_usr_games(already):
     return games
 
 
+def normalize_name(name):
+    """Loose form of a game name so 'Half-Life®' and 'half life' compare equal."""
+    name = name.casefold().replace("&", "and")
+    return re.sub(r"[^a-z0-9]+", "", name)
+
+
+def hide_lutris_duplicates(games):
+    """If a game is on Steam, hide the copy that Lutris also lists."""
+    steam_names = {normalize_name(g.name) for g in games if g.source == "steam"}
+    return [g for g in games
+            if not (g.source == "lutris" and normalize_name(g.name) in steam_names)]
+
+
 def find_games():
     games = []
     for scanner in (scan_steam, scan_lutris, scan_heroic):
@@ -640,6 +653,7 @@ def find_games():
         games += scan_usr_games(exec_names)
     except Exception:
         pass
+    games = hide_lutris_duplicates(games)
     games.sort(key=lambda g: g.name.lower())
     return games
 
