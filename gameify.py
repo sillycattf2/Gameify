@@ -5,11 +5,14 @@ how much disk space each one takes up, how long you've played it, and when you
 last played it.
 
 Detects games from:
-  * Steam            (native + Flatpak installs, all library folders)
+  * Steam            (native + Flatpak installs, all library folders,
+                      plus games you added with "Add a Non-Steam Game")
   * Lutris           (pga.db, native + Flatpak)
   * Heroic           (Epic via legendary, GOG)  -- native + Flatpak
   * .desktop files   (category "Game": native, Flatpak, Snap)
   * /usr/games       (classic Debian/Ubuntu terminal games)
+
+The list updates by itself when games are installed or removed.
 
 Playtime / last played comes from Steam, Lutris and Heroic's own records. For
 games that don't track it (native, Flatpak, Snap), gameify times the sessions
@@ -24,8 +27,9 @@ Usage:
 Keys (TUI):
   Up/Down, j/k   move          PgUp/PgDn   page          g/G   top/bottom
   /              search        Esc         clear search
-  Tab or f       cycle source filter       s             cycle sort
-  Enter          launch game   q           quit
+  Tab, Left/Right  switch source tab       s             cycle sort
+  Enter          launch game (gameify closes while you play, then reopens)
+  q              quit
 
 Only the Python 3 standard library is required.
 """
@@ -33,6 +37,7 @@ Only the Python 3 standard library is required.
 import argparse
 import curses
 import json
+import locale
 import os
 import queue
 import re
@@ -43,6 +48,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -404,7 +410,109 @@ def steam_stats():
     return stats
 
 
-def scan_steam():
+def parse_binary_vdf(data):
+    """Parse Valve's binary KeyValues format (used by shortcuts.vdf) into nested dicts."""
+    pos = 0
+
+    def read_cstr():
+        nonlocal pos
+        end = data.index(b"\x00", pos)
+        text = data[pos:end].decode("utf-8", "replace")
+        pos = end + 1
+        return text
+
+    def read_int(size):
+        nonlocal pos
+        value = int.from_bytes(data[pos:pos + size], "little")
+        pos += size
+        return value
+
+    def read_dict():
+        nonlocal pos
+        result = {}
+        while pos < len(data):
+            kind = data[pos]
+            pos += 1
+            if kind == 0x08:                 # end of this section
+                return result
+            key = read_cstr()
+            if kind == 0x00:
+                result[key] = read_dict()
+            elif kind == 0x01:
+                result[key] = read_cstr()
+            elif kind in (0x02, 0x03, 0x04, 0x06):
+                result[key] = read_int(4)
+            elif kind in (0x07, 0x0A):
+                result[key] = read_int(8)
+            else:
+                raise ValueError(f"unknown VDF type {kind}")
+        return result
+
+    return read_dict()
+
+
+# folders that hold lots of unrelated files: never measure these as "the game's folder"
+SHARED_FOLDERS = {
+    Path("/"), HOME, HOME / "Downloads", HOME / "Desktop", HOME / "Documents", HOME / "Games",
+    HOME / "bin", HOME / ".local/bin", HOME / "Applications", HOME / "AppImages", Path("/opt"),
+}
+SYSTEM_FOLDERS = [Path(p) for p in (
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/var", "/snap", "/proc", "/sys",
+    "/dev", "/boot", "/run")]
+
+
+def shortcut_folder(exe):
+    """The game's own folder (the program's parent), or '' if it's a shared place."""
+    parent = Path(os.path.realpath(exe)).parent
+    if parent in SHARED_FOLDERS:
+        return ""
+    if any(parent == p or p in parent.parents for p in SYSTEM_FOLDERS):
+        return ""
+    return str(parent)
+
+
+def scan_steam_shortcuts(stats, launch_base):
+    """Games added to Steam with "Add a Non-Steam Game" (stored in shortcuts.vdf)."""
+    games, seen = [], set()
+    for root in sorted({r.resolve() for r in STEAM_ROOTS if r.is_dir()}):
+        for cfg in sorted(root.glob("userdata/*/config/shortcuts.vdf")):
+            try:
+                tree = parse_binary_vdf(cfg.read_bytes())
+            except (OSError, ValueError, IndexError):
+                continue
+            shortcuts = ci_get(tree, "shortcuts")
+            if not isinstance(shortcuts, dict):
+                continue
+            for entry in shortcuts.values():
+                name, raw_exe = ci_get(entry, "AppName"), ci_get(entry, "Exe")
+                if not isinstance(name, str) or not isinstance(raw_exe, str):
+                    continue
+                exe = raw_exe.strip().strip("\"'")
+                if not name or not exe or ci_get(entry, "IsHidden") == 1:
+                    continue
+                appid = ci_get(entry, "appid")
+                if not isinstance(appid, int):   # older Steam: derived from program + name
+                    appid = zlib.crc32((raw_exe + name).encode()) | 0x80000000
+                appid &= 0xFFFFFFFF
+                if appid in seen:
+                    continue
+                path = exe if os.path.isabs(exe) else shutil.which(exe)
+                if not path or not os.path.exists(path):
+                    continue   # the program has been removed
+                seen.add(appid)
+                minutes, last = stats.get(str(appid), (0, 0))
+                last_play = ci_get(entry, "LastPlayTime")
+                games.append(Game(
+                    name=name, source="non-steam", app_id=str(appid), path=path,
+                    install_dir=shortcut_folder(path), playtime_seconds=minutes * 60,
+                    last_played=max(last, last_play if isinstance(last_play, int) else 0),
+                    launch=launch_base + [f"steam://rungameid/{(appid << 32) | 0x02000000}"],
+                ))
+    return games
+
+
+def steam_libraries():
+    """Every Steam library's steamapps folder (including ones on other drives)."""
     libraries = set()
     for root in STEAM_ROOTS:
         steamapps = root / "steamapps"
@@ -414,6 +522,11 @@ def scan_steam():
         for key, value in KV.findall(read_text(steamapps / "libraryfolders.vdf")):
             if key == "path":
                 libraries.add(Path(value) / "steamapps")
+    return libraries
+
+
+def scan_steam():
+    libraries = steam_libraries()
 
     base = ["steam"] if shutil.which("steam") else ["xdg-open"]
     stats = steam_stats()
@@ -446,11 +559,15 @@ def scan_steam():
             minutes, last = stats.get(appid, (0, 0))
             folder = str(lib / "common" / kv.get("installdir", ""))
             games.append(Game(
-                name=name, source="steam", size=size,
+                name=name, source="steam", size=size, app_id=appid,
                 path=folder, install_dir=folder,
                 playtime_seconds=minutes * 60, last_played=max(last, manifest_last),
                 launch=base + [f"steam://rungameid/{appid}"],
             ))
+    try:
+        games += scan_steam_shortcuts(stats, base)
+    except Exception:
+        pass
     return games
 
 
@@ -471,13 +588,16 @@ def lutris_install_incomplete(games_dir, configpath):
     return False
 
 
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+LUTRIS_SOURCES = [   # (database, folder holding the per-game config files)
+    (HOME / ".local/share/lutris/pga.db", XDG_CONFIG / "lutris/games"),
+    (HOME / ".var/app/net.lutris.Lutris/data/lutris/pga.db",
+     HOME / ".var/app/net.lutris.Lutris/config/lutris/games"),
+]
+
+
 def scan_lutris():
-    xdg_config = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
-    sources = [   # (database, folder holding the per-game config files)
-        (HOME / ".local/share/lutris/pga.db", xdg_config / "lutris/games"),
-        (HOME / ".var/app/net.lutris.Lutris/data/lutris/pga.db",
-         HOME / ".var/app/net.lutris.Lutris/config/lutris/games"),
-    ]
+    sources = LUTRIS_SOURCES
     steam_here = any((root / "steamapps").is_dir() for root in STEAM_ROOTS)
     games = []
     for db, games_dir in sources:
@@ -528,11 +648,14 @@ def heroic_playtime(root, app_name):
         return 0, 0
 
 
+HEROIC_ROOTS = [
+    HOME / ".config/heroic",
+    HOME / ".var/app/com.heroicgameslauncher.hgl/config/heroic",
+]
+
+
 def scan_heroic():
-    roots = [
-        HOME / ".config/heroic",
-        HOME / ".var/app/com.heroicgameslauncher.hgl/config/heroic",
-    ]
+    roots = HEROIC_ROOTS
     games = []
     for root in roots:
         if not root.is_dir():
@@ -710,20 +833,408 @@ def find_games():
 
 
 # --------------------------------------------------------------------------- #
-# TUI
+# auto-update: notice installs and uninstalls while the TUI is open
+# --------------------------------------------------------------------------- #
+
+POLL_SECONDS = 2   # how often the cheap "did anything change?" check runs
+RESCAN_GAP = 5     # never rescan more often than this (Steam rewrites files while downloading)
+
+
+def watch_paths():
+    """The files and folders whose changes mean a game was installed or removed."""
+    paths = []
+    for lib in steam_libraries():
+        paths += [lib, lib / "libraryfolders.vdf"] + sorted(lib.glob("appmanifest_*.acf"))
+    for root in STEAM_ROOTS:
+        paths += sorted(root.glob("userdata/*/config/shortcuts.vdf"))
+    for db, _games_dir in LUTRIS_SOURCES:
+        paths += [db, Path(f"{db}-wal")]
+    for root in HEROIC_ROOTS:
+        paths += [root / "legendaryConfig/legendary/installed.json",
+                  root / "gog_store/installed.json"]
+    paths += DESKTOP_DIRS + [Path("/usr/games"), Path("/usr/local/games")]
+    return paths
+
+
+def watch_fingerprint():
+    """A snapshot that changes whenever something gameify reads has changed."""
+    snapshot = []
+    for path in watch_paths():
+        try:
+            st = os.stat(path)
+            snapshot.append((str(path), st.st_mtime_ns, st.st_size))
+        except OSError:
+            snapshot.append((str(path), None, None))   # missing now; noticed if it appears
+    return tuple(snapshot)
+
+
+def describe_changes(before, after):
+    """'New: Hades   Removed: Portal 2' from two sets of (source, name)."""
+    def names(keys):
+        listed = sorted({name for _source, name in keys}, key=str.lower)
+        if len(listed) > 3:
+            return ", ".join(listed[:3]) + f" and {len(listed) - 3} more"
+        return ", ".join(listed)
+
+    parts = []
+    if after - before:
+        parts.append("New: " + names(after - before))
+    if before - after:
+        parts.append("Removed: " + names(before - after))
+    return "   ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# TUI look & feel
 # --------------------------------------------------------------------------- #
 
 SORTS = ("name", "source", "size", "playtime", "recent")
-SOURCE_COLORS = {"steam": 4, "lutris": 5, "epic": 6, "gog": 6,
-                 "flatpak": 7, "snap": 7, "native": 8}
+SORT_LABELS = {"name": "Name", "source": "Source", "size": "Size",
+               "playtime": "Playtime", "recent": "Last played"}
+SORT_COLUMN = {"name": "name", "source": "source", "size": "size",
+               "playtime": "played", "recent": "last"}
+SORT_DESCENDING = {"size", "playtime", "recent"}   # biggest / most recent first
 
-# (header, width, alignment, value getter) - dropped right-to-left on narrow terminals
-COLUMNS = [
-    ("SOURCE", 9, "<", lambda g: g.source),
-    ("SIZE", 9, ">", lambda g: human_size(g.size)),
-    ("PLAYED", 9, ">", lambda g: fmt_playtime(g.playtime_seconds)),
-    ("LAST PLAYED", 12, "<", lambda g: fmt_last_played(g.last_played)),
-]
+SOURCE_ORDER = ["steam", "non-steam", "lutris", "epic", "gog", "flatpak", "snap", "native"]
+SOURCE_NAMES = {"steam": "Steam", "non-steam": "Non-Steam", "lutris": "Lutris", "epic": "Epic",
+                "gog": "GOG", "flatpak": "Flatpak", "snap": "Snap", "native": "Native"}
+
+MIN_W, MIN_H = 50, 14
+BAR_W = 8          # width of the little size bars
+CHROME_ROWS = 11   # screen rows used by everything except the game rows
+
+GLYPHS_UNICODE = dict(
+    tl="╭", tr="╮", bl="╰", br="╯", h="─", v="│", ml="├", mr="┤",
+    full="█", empty="░", dot="●", pointer="▌", up="▲", down="▼", sep="·", thumb="┃",
+    cursor="▏", more_l="‹", more_r="›", ellipsis="…", logo="◆",
+    enter="⏎", updown="↑↓", leftright="←→", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+GLYPHS_ASCII = dict(
+    tl="+", tr="+", bl="+", br="+", h="-", v="|", ml="+", mr="+",
+    full="#", empty=".", dot="*", pointer=">", up="^", down="v", sep="-", thumb="#",
+    cursor="_", more_l="<", more_r=">", ellipsis="~", logo="*",
+    enter="Enter", updown="j/k", leftright="h/l", spinner="|/-\\")
+
+THEME_KEYS = (["base", "dim", "border", "accent", "accent_b", "pill", "good", "warn", "bad",
+               "hot", "sel", "sel_b", "sel_accent", "keycap"]
+              + ["src:" + s for s in SOURCE_ORDER])
+
+
+def source_name(source):
+    return SOURCE_NAMES.get(source, source.title())
+
+
+def source_list(games):
+    present = {g.source for g in games}
+    return ["all"] + [s for s in SOURCE_ORDER if s in present] + sorted(present - set(SOURCE_ORDER))
+
+
+def fit(text, width, align="<", ellipsis="~"):
+    """Pad or cut text to exactly `width` characters."""
+    if width <= 0:
+        return ""
+    if len(text) > width:
+        text = text[:width - 1] + ellipsis if width > 1 else text[:width]
+    return f"{text:{align}{width}}"
+
+
+def make_theme():
+    """Curses attributes for every colour role (256 colours when available)."""
+    T = dict.fromkeys(THEME_KEYS, 0)
+    T.update(dim=curses.A_DIM, border=curses.A_DIM, accent=curses.A_BOLD, accent_b=curses.A_BOLD,
+             pill=curses.A_REVERSE | curses.A_BOLD, sel=curses.A_REVERSE,
+             sel_b=curses.A_REVERSE | curses.A_BOLD, sel_accent=curses.A_REVERSE | curses.A_BOLD,
+             keycap=curses.A_REVERSE)
+    if not curses.has_colors():
+        return T
+    curses.start_color()
+    curses.use_default_colors()
+    count = [0]
+
+    def pair(fg, bg=-1):
+        count[0] += 1
+        curses.init_pair(count[0], fg, bg)
+        return curses.color_pair(count[0])
+
+    C = curses
+    if curses.COLORS >= 256:
+        T.update(dim=pair(245), border=pair(240), accent=pair(75), accent_b=pair(75) | C.A_BOLD,
+                 pill=pair(16, 75) | C.A_BOLD, good=pair(114), warn=pair(221), bad=pair(203),
+                 hot=pair(209), sel=pair(255, 24), sel_b=pair(255, 24) | C.A_BOLD,
+                 sel_accent=pair(117, 24) | C.A_BOLD, keycap=pair(16, 252))
+        palette = {"steam": 75, "non-steam": 117, "lutris": 214, "epic": 250,
+                   "gog": 141, "flatpak": 114, "snap": 211, "native": 180}
+    else:
+        T.update(accent=pair(C.COLOR_CYAN), accent_b=pair(C.COLOR_CYAN) | C.A_BOLD,
+                 pill=pair(C.COLOR_BLACK, C.COLOR_CYAN) | C.A_BOLD, good=pair(C.COLOR_GREEN),
+                 warn=pair(C.COLOR_YELLOW), bad=pair(C.COLOR_RED),
+                 hot=pair(C.COLOR_YELLOW) | C.A_BOLD, sel=pair(C.COLOR_BLACK, C.COLOR_CYAN),
+                 sel_b=pair(C.COLOR_BLACK, C.COLOR_CYAN) | C.A_BOLD,
+                 sel_accent=pair(C.COLOR_BLACK, C.COLOR_CYAN) | C.A_BOLD,
+                 keycap=pair(C.COLOR_BLACK, C.COLOR_WHITE))
+        palette = {"steam": C.COLOR_CYAN, "non-steam": C.COLOR_BLUE, "lutris": C.COLOR_YELLOW,
+                   "epic": C.COLOR_WHITE, "gog": C.COLOR_MAGENTA, "flatpak": C.COLOR_GREEN,
+                   "snap": C.COLOR_RED, "native": C.COLOR_WHITE}
+    for source, colour in palette.items():
+        T["src:" + source] = pair(colour)
+    return T
+
+
+def pick_columns(inner):
+    """Choose the columns that fit: (columns, name width, show size bars)."""
+    def make(bars):
+        return [("source", "SOURCE", 11, "<"),
+                ("size", "SIZE", BAR_W + 10 if bars else 9, "<" if bars else ">"),
+                ("played", "PLAYED", 8, ">"),
+                ("last", "LAST PLAYED", 13, "<")]
+
+    def name_width(cols):
+        return inner - 4 - sum(2 + c[2] for c in cols)
+
+    for bars, need in ((True, 26), (False, 18)):
+        cols = make(bars)
+        if name_width(cols) >= need:
+            return cols, name_width(cols), bars
+    cols = make(False)
+    while cols and name_width(cols) < 18:
+        cols.pop()
+    return cols, name_width(cols), False
+
+
+def cell_parts(g, key, width, bars, max_size, T, G):
+    """The (text, attr) pieces that make up one table cell."""
+    if key == "source":
+        label = fit(f"{G['dot']} {source_name(g.source)}", width, "<", G["ellipsis"])
+        return [(label, T.get("src:" + g.source, T["accent"]))]
+    if key == "size":
+        text_attr = T["base"] if g.size else T["dim"]
+        if not bars:
+            return [(fit(human_size(g.size), width, ">", G["ellipsis"]), text_attr)]
+        ratio = (g.size or 0) / max_size if max_size else 0
+        filled = max(1, round(ratio * BAR_W)) if g.size and max_size else 0
+        tier = (T["bad"] if ratio >= .75 else T["hot"] if ratio >= .5
+                else T["warn"] if ratio >= .25 else T["good"])
+        text = " " + fit(human_size(g.size), width - BAR_W - 1, ">", G["ellipsis"])
+        return [(G["full"] * filled, tier), (G["empty"] * (BAR_W - filled), T["border"]),
+                (text, text_attr)]
+    if key == "played":
+        return [(fit(fmt_playtime(g.playtime_seconds), width, ">", G["ellipsis"]),
+                 T["base"] if g.playtime_seconds else T["dim"])]
+    text = fmt_last_played(g.last_played)
+    attr = T["dim"] if text == "-" else T["good"] if text in ("today", "yesterday") else T["base"]
+    return [(fit(text, width, "<", G["ellipsis"]), attr)]
+
+
+def draw_screen(put, w, h, T, G, st):
+    """Paint one frame. `put(y, x, text, attr)` writes text; `st` is the UI state."""
+    W = w - 1                                   # never touch the last column
+    if W < MIN_W or h < MIN_H:
+        put(0, 0, f"Terminal too small (need {MIN_W + 1}x{MIN_H})", T["warn"])
+        return
+    view, sel, top = st["view"], st["sel"], st["top"]
+    N, inner = h - CHROME_ROWS, W - 2
+    border = T["border"]
+
+    def segs(y, x, parts):
+        """Write (text, attr) pieces one after another; returns the column after the last."""
+        for text, attr in parts:
+            put(y, x, text, attr)
+            x += len(text)
+        return x
+
+    # ---- row 0: title bar with live totals ----
+    pill = f" {G['logo']} GAMEIFY "
+    x = segs(0, 0, [(pill, T["pill"])])
+    tagline = W >= 84
+    if tagline:
+        put(0, x + 2, "every game on this machine", T["dim"])
+    sep = (f"  {G['sep']}  ", border)
+    count, games = (str(len(view)), T["accent_b"]), (" games", T["dim"])
+    used = [(human_size(st["total_size"]) if st["total_size"] else "-", T["accent_b"]),
+            (" used", T["dim"])]
+    played = [(fmt_playtime(st["total_play"]), T["accent_b"]), (" played", T["dim"])]
+    spin = []
+    if st["pending"]:
+        frame = G["spinner"][st["frame"] % len(G["spinner"])]
+        spin = [(f"{frame} measuring", T["warn"]), sep]
+    options = [spin + [count, games, sep] + used + ([sep] + played if st["total_play"] else []),
+               spin + [count, games, sep] + used,
+               [count, games]]
+    for parts in options:
+        width = sum(len(t) for t, _ in parts)
+        if W - width - 1 > len(pill) + 2 + (26 if tagline else 0) + 2:
+            segs(0, W - width - 1, parts)
+            break
+
+    # ---- row 1: source tabs (sources with no search matches are hidden) ----
+    tabs = [(s, "All" if s == "all" else source_name(s), st["counts"].get(s, 0))
+            for s in st["sources"]]
+    shown = [i for i, (s, _lab, n) in enumerate(tabs) if s == "all" or n or i == st["src_i"]]
+    texts = {i: (f" {tabs[i][1]} {tabs[i][2]} " if tabs[i][0] == "all"
+                 else f" {G['dot']} {tabs[i][1]} {tabs[i][2]} ") for i in shown}
+    first = 0   # slide the window right until the active tab is visible
+    while first < len(shown) - 1 and shown[first] != st["src_i"] and sum(
+            len(texts[i]) for i in shown[first:shown.index(st["src_i"]) + 1]) > W - 6:
+        first += 1
+    x = 1
+    if first:
+        put(1, x, G["more_l"], T["dim"])
+        x += 2
+    for i in shown[first:]:
+        if x + len(texts[i]) > W - 2:
+            put(1, W - 2, G["more_r"], T["dim"])
+            break
+        s, lab, n = tabs[i]
+        if i == st["src_i"]:
+            put(1, x, texts[i], T["pill"])
+        elif s == "all":
+            put(1, x, texts[i], T["dim"])
+        else:
+            segs(1, x, [(f" {G['dot']}", T.get("src:" + s, T["accent"])),
+                        (f" {lab} {n} ", T["dim"])])
+        x += len(texts[i])
+
+    # ---- row 2: search box and sort ----
+    segs(2, 1, [(" / ", T["keycap"])])
+    if st["searching"]:
+        end = segs(2, 5, [("Search: ", T["dim"]), (st["query"] + G["cursor"], T["accent_b"])])
+    elif st["query"]:
+        end = segs(2, 5, [("Search: ", T["dim"]), (st["query"], T["accent_b"]),
+                          ("   esc to clear", T["dim"])])
+    else:
+        end = segs(2, 5, [("press / to search", T["dim"])])
+    arrow = G["down"] if st["sort"] in SORT_DESCENDING else G["up"]
+    sort_parts = [("Sort: ", T["dim"]), (f"{SORT_LABELS[st['sort']]} {arrow}", T["accent_b"]),
+                  ("  (s)", T["dim"])]
+    sort_w = sum(len(t) for t, _ in sort_parts)
+    if W - sort_w - 1 > end + 2:
+        segs(2, W - sort_w - 1, sort_parts)
+
+    # ---- the table: rounded box, header, rows, scrollbar ----
+    cols, name_w, bars = pick_columns(inner)
+    y0 = 3
+    put(y0, 0, G["tl"] + G["h"] * inner + G["tr"], border)
+    put(y0 + 2, 0, G["ml"] + G["h"] * inner + G["mr"], border)
+    put(y0 + 3 + N, 0, G["bl"] + G["h"] * inner + G["br"], border)
+    put(y0 + 1, 0, G["v"], border)
+    put(y0 + 1, W - 1, G["v"], border)
+
+    active = SORT_COLUMN[st["sort"]]
+    arrow_now = G["down"] if st["sort"] in SORT_DESCENDING else G["up"]
+
+    def header(key, title, width, align):
+        label = title + (f" {arrow_now}" if key == active else "")
+        return fit(label, width, align, G["ellipsis"]), T["accent_b"] if key == active else T["dim"]
+
+    text, attr = header("name", "NAME", name_w, "<")
+    put(y0 + 1, 4, text, attr)
+    x = 4 + name_w + 2
+    for key, title, width, align in cols:
+        text, attr = header(key, title, width, align)
+        put(y0 + 1, x, text, attr)
+        x += width + 2
+
+    scroll = len(view) > N
+    if scroll:
+        thumb_len = max(1, N * N // len(view))
+        thumb_at = round(top / (len(view) - N) * (N - thumb_len))
+    max_size = max((g.size or 0 for g in view), default=0)
+
+    for i in range(N):
+        y = y0 + 3 + i
+        put(y, 0, G["v"], border)
+        if scroll and thumb_at <= i < thumb_at + thumb_len:
+            put(y, W - 1, G["thumb"], T["accent"])
+        else:
+            put(y, W - 1, G["v"], border)
+        idx = top + i
+        if idx >= len(view):
+            continue
+        g, chosen = view[idx], idx == sel
+        name = fit(g.name, name_w, "<", G["ellipsis"])
+        if chosen:
+            put(y, 1, " " * inner, T["sel"])
+            put(y, 2, G["pointer"], T["sel_accent"])
+            put(y, 4, name, T["sel_b"])
+        else:
+            put(y, 4, name, T["base"])
+        x = 4 + name_w + 2
+        for key, _title, width, _align in cols:
+            parts = cell_parts(g, key, width, bars, max_size, T, G)
+            if chosen:
+                parts = [(t, T["sel"]) for t, _ in parts]
+            segs(y, x, parts)
+            x += width + 2
+
+    if not view:
+        if st["query"]:
+            note = f"No games match \"{st['query']}\""
+        elif st["all_count"]:
+            note = "No games in this source"
+        else:
+            note = "No games found on this system"
+        put(y0 + 3 + N // 2, max(2, (W - len(note)) // 2), note, T["dim"])
+
+    # ---- details for the selected game ----
+    if view:
+        g = view[sel]
+        if g.size is None:
+            size_txt = "measuring size..."
+        elif g.size:
+            size_txt = f"{human_size(g.size)} on disk"
+        else:
+            size_txt = "size unknown"
+        play_txt = (f"{fmt_playtime(g.playtime_seconds)} played" if g.playtime_seconds
+                    else "no playtime recorded")
+        if g.last_played:
+            stamp = datetime.fromtimestamp(g.last_played).strftime("%Y-%m-%d %H:%M")
+            last_txt = f"last played {fmt_last_played(g.last_played)} ({stamp})"
+        else:
+            last_txt = "no play history"
+        badge = f"   {G['dot']} {source_name(g.source)}"
+        info = [size_txt, play_txt, last_txt]
+        while len(info) > 1 and W - 3 - len(badge) - sum(len(p) + 5 for p in info) < 20:
+            info.pop()                       # drop the least important facts on narrow screens
+        room = max(8, W - 3 - len(badge) - sum(len(p) + 5 for p in info))
+        parts = [("  " + fit(g.name, min(len(g.name), room), "<", G["ellipsis"]), T["accent_b"]),
+                 (badge, T.get("src:" + g.source, T["accent"]))]
+        for piece in info:
+            parts += [sep, (piece, T["base"])]
+        segs(h - 4, 1, parts)
+        put(h - 3, 3, g.path or " ".join(g.launch), T["dim"])
+
+    if st["message"]:
+        put(h - 2, 3, st["message"], T["warn"])
+
+    # ---- footer: key hints ----
+    if st["searching"]:
+        keys = [("type", "to search"), (G["enter"], "accept"), ("esc", "clear")]
+    else:
+        keys = [(G["updown"], "move"), (G["enter"], "launch"), ("/", "search"),
+                (G["leftright"], "source"), ("s", "sort"), ("q", "quit")]
+    x = 1
+    for key, label in keys:
+        cap = f" {key} "
+        if x + len(cap) + len(label) + 3 > W:
+            break
+        put(h - 1, x, cap, T["keycap"])
+        put(h - 1, x + len(cap) + 1, label, T["dim"])
+        x += len(cap) + len(label) + 4
+    live = f"{G['dot']} live"
+    if W - len(live) - 1 > x:
+        put(h - 1, W - len(live) - 1, live, T["good"])
+
+
+def make_view(all_games, sources, src_i, query, sort_mode):
+    """Games to show, plus per-source counts for the tabs (counts respect the search)."""
+    base = all_games
+    if query:
+        q = query.lower()
+        base = [g for g in base if q in g.name.lower()]
+    counts = {"all": len(base)}
+    for g in base:
+        counts[g.source] = counts.get(g.source, 0) + 1
+    view = base if sources[src_i] == "all" else [g for g in base if g.source == sources[src_i]]
+    return sort_games(view, sort_mode), counts
 
 
 def sort_games(games, mode):
@@ -739,120 +1250,190 @@ def sort_games(games, mode):
     return sorted(games, key=name)
 
 
+# --------------------------------------------------------------------------- #
+# playing: close the TUI while a game runs, reopen it when the game closes
+# --------------------------------------------------------------------------- #
+
+START_TIMEOUT = 180   # seconds to wait for a launcher (Steam, Lutris...) to actually start the game
+
+
+def process_cmdlines():
+    """Command line (list of arguments) of every running process."""
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        if raw:
+            yield raw.decode(errors="replace").split("\0")
+
+
+def is_running(matcher):
+    return any(matcher(args) for args in process_cmdlines())
+
+
+def game_matcher(game):
+    """A function that recognises the game's running process, or None if we can't tell."""
+    target = game.launch[-1] if game.launch else ""
+    if game.source in ("steam", "non-steam"):
+        # Steam wraps every game in a "reaper SteamLaunch AppId=<id> -- ..." process.
+        # Accept both id forms (the launch id and the short appid) to be safe.
+        ids = {game.app_id, (re.search(r"rungameid/(\d+)", target) or [None, ""])[1]} - {""}
+        if ids:
+            needles = {f"AppId={i}" for i in ids}
+            return lambda args: "SteamLaunch" in args and any(a in needles for a in args)
+    if game.source == "lutris":   # Lutris runs games through its "lutris-wrapper" process
+        return lambda args: any(a.endswith("lutris-wrapper") for a in args) and game.name in args
+    if game.source in ("epic", "gog"):
+        m = re.search(r"launch/[^/]+/([^/]+)$", target)
+        if m:   # Heroic runs legendary / gogdl with "launch <appName>" (best effort)
+            app = m.group(1)
+            return lambda args: app in args and "launch" in args
+    return None
+
+
+def wait_for_game(matcher, start_timeout=None, quiet_polls=3):
+    """Wait for the game to start, then for it to close. False if it never started."""
+    deadline = time.time() + (START_TIMEOUT if start_timeout is None else start_timeout)
+    while not is_running(matcher):
+        if time.time() > deadline:
+            return False
+        time.sleep(1)
+    quiet = 0   # must be gone for a few polls in a row (games sometimes restart helpers)
+    while quiet < quiet_polls:
+        quiet = 0 if is_running(matcher) else quiet + 1
+        time.sleep(1)
+    return True
+
+
+def play(game, tracker):
+    """Launch a game with the TUI closed. Returns when the game closes (or on Ctrl+C).
+    The return value is a status message to show once the TUI is back."""
+    track = tracker.applies_to(game)
+    token = None
+    curses.endwin()   # hand the terminal back: the TUI disappears while you play
+    try:
+        if game.terminal:   # a terminal game uses the terminal itself
+            token = tracker.begin(game) if track else None
+            subprocess.call(game.launch)
+            return f"Back from {game.name}"
+
+        clear = "\033[2J\033[H" if sys.stdout.isatty() else ""
+        print(f"{clear}\n  Playing {game.name}\n"
+              f"  gameify will reopen when you close the game.   (Ctrl+C to come back now)\n",
+              flush=True)
+        proc = subprocess.Popen(
+            game.launch, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        if track:
+            token = tracker.begin(game)
+
+        if game.source in ("native", "flatpak", "snap"):
+            proc.wait()   # these run as the process we started
+        else:
+            matcher = game_matcher(game)
+            if matcher is None:
+                input("  gameify can't tell when this game closes. Press Enter to come back... ")
+            elif not wait_for_game(matcher):
+                return f"Didn't see {game.name} start"
+        return ""
+    except (KeyboardInterrupt, EOFError):
+        return f"Back in gameify ({game.name} may still be running)"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"Could not launch {game.name}: {exc}"
+    finally:
+        if token is not None:
+            tracker.end(token)
+
+
+def refresh_games(old_games, tracker):
+    """Scan again (playtime and last played have changed), keeping sizes we already measured."""
+    old = {(g.source, g.name): g for g in old_games}
+    fresh = find_games()
+    tracker.apply(fresh)
+    for g in fresh:
+        previous = old.get((g.source, g.name))
+        if g.size is None and previous is not None and previous.size is not None:
+            g.size = previous.size
+    start_size_workers(fresh)
+    return fresh
+
+
 def tui(stdscr, all_games, tracker, start_sort=0):
-    curses.curs_set(0)
-    colors = curses.has_colors()
-    if colors:
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)   # selection
-        curses.init_pair(2, curses.COLOR_CYAN, -1)                   # title
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)                 # status
-        curses.init_pair(4, curses.COLOR_BLUE, -1)
-        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
-        curses.init_pair(6, curses.COLOR_GREEN, -1)
-        curses.init_pair(7, curses.COLOR_YELLOW, -1)
-        curses.init_pair(8, curses.COLOR_WHITE, -1)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    G = GLYPHS_UNICODE if "utf" in locale.getpreferredencoding(False).lower() else GLYPHS_ASCII
+    T = make_theme()
 
     def put(y, x, text, attr=0):
         h, w = stdscr.getmaxyx()
-        if 0 <= y < h and x < w:
+        if 0 <= y < h and 0 <= x < w:
             try:
                 stdscr.addstr(y, x, text[: max(0, w - x - 1)], attr)
             except curses.error:
                 pass
 
-    sources = ["all"] + sorted({g.source for g in all_games})
+    sources = source_list(all_games)
     src_i = sel = top = 0
     sort_i = start_sort
     query, searching, message = "", False, ""
+    reselect = None   # (source, name) of the game to keep selected after a rescan
+    selected = None   # (source, name) of the highlighted game, remembered for rescans
+    fingerprint, last_poll, last_rescan, dirty = watch_fingerprint(), time.time(), 0.0, False
 
     while True:
-        # ---- build the current view ----
-        view = all_games
-        if sources[src_i] != "all":
-            view = [g for g in view if g.source == sources[src_i]]
-        if query:
-            q = query.lower()
-            view = [g for g in view if q in g.name.lower()]
-        view = sort_games(view, SORTS[sort_i])
-        pending = any(g.size is None for g in all_games)
-        total_size = sum(g.size or 0 for g in view)
-        total_play = sum(g.playtime_seconds for g in view)
+        # ---- auto-update: notice installs / uninstalls without reopening ----
+        now = time.time()
+        if now - last_poll >= POLL_SECONDS:
+            last_poll = now
+            current = watch_fingerprint()
+            if current != fingerprint:
+                fingerprint, dirty = current, True
+        if dirty and now - last_rescan >= RESCAN_GAP:
+            dirty, last_rescan = False, now
+            before = {(g.source, g.name) for g in all_games}
+            current_source = sources[src_i]
+            fresh = refresh_games(all_games, tracker)
+            all_games[:] = fresh
+            sources = source_list(all_games)
+            src_i = sources.index(current_source) if current_source in sources else 0
+            reselect = selected
+            note = describe_changes(before, {(g.source, g.name) for g in fresh})
+            if note:
+                message = note
 
         h, w = stdscr.getmaxyx()
-        list_h = h - 6
+        list_h = max(1, h - CHROME_ROWS)
+        view, counts = make_view(all_games, sources, src_i, query, SORTS[sort_i])
+        if reselect:
+            sel = next((i for i, x in enumerate(view) if (x.source, x.name) == reselect), sel)
+            reselect = None
+        pending = any(g.size is None for g in all_games)
         sel = max(0, min(sel, len(view) - 1))
-        if list_h > 0:
-            if sel < top:
-                top = sel
-            elif sel >= top + list_h:
-                top = sel - list_h + 1
-            top = max(0, min(top, max(0, len(view) - list_h)))
+        selected = (view[sel].source, view[sel].name) if view else None
+        if sel < top:
+            top = sel
+        elif sel >= top + list_h:
+            top = sel - list_h + 1
+        top = max(0, min(top, max(0, len(view) - list_h)))
 
-        # ---- layout: drop right-hand columns until the name column has room ----
-        cols = list(COLUMNS)
-        while cols and (w - 2) - sum(1 + c[1] for c in cols) < 18:
-            cols.pop()
-        name_w = max(10, (w - 2) - sum(1 + c[1] for c in cols))
-
-        def render(name, cell_of):
-            line = f"{name[:name_w]:<{name_w}}"
-            for header, width, align, getter in cols:
-                line += f" {cell_of(getter, header)[:width]:{align}{width}}"
-            return line
-
-        # ---- draw ----
+        state = dict(
+            view=view, sel=sel, top=top, sources=sources, src_i=src_i, counts=counts,
+            sort=SORTS[sort_i], query=query, searching=searching, message=message,
+            pending=pending, frame=int(time.time() * 10), all_count=len(all_games),
+            total_size=sum(g.size or 0 for g in view),
+            total_play=sum(g.playtime_seconds for g in view))
         stdscr.erase()
-        if h < 8 or w < 36:
-            put(0, 0, "Terminal too small")
-        else:
-            title = (f" GAMEIFY  -  {len(view)} shown / {len(all_games)} installed"
-                     f"  -  {human_size(total_size) if total_size else '-'} used")
-            if total_play:
-                title += f"  -  {fmt_playtime(total_play)} played"
-            if pending:
-                title += "  (measuring...)"
-            put(0, 0, title.ljust(w - 1),
-                curses.color_pair(2) | curses.A_BOLD if colors else curses.A_BOLD)
-            cursor = "_" if searching else ""
-            put(1, 1, f"Source: {sources[src_i]}   Sort: {SORTS[sort_i]}   Search: {query}{cursor}",
-                curses.A_BOLD if searching else curses.A_DIM)
-
-            put(2, 1, render("NAME", lambda getter, header: header), curses.A_UNDERLINE)
-
-            if not view:
-                put(4, 2, "No games found." if not all_games else "No matches.")
-            for row in range(list_h):
-                idx = top + row
-                if idx >= len(view):
-                    break
-                g = view[idx]
-                line = render(g.name, lambda getter, header, g=g: getter(g))
-                if idx == sel:
-                    put(3 + row, 1, line.ljust(w - 2),
-                        curses.color_pair(1) if colors else curses.A_REVERSE)
-                else:
-                    put(3 + row, 1, line)
-                    if colors and cols and cols[0][0] == "SOURCE":
-                        put(3 + row, 2 + name_w, f"{g.source:<{cols[0][1]}}",
-                            curses.color_pair(SOURCE_COLORS.get(g.source, 8)))
-
-            if view:
-                g = view[sel]
-                detail = g.path or " ".join(g.launch)
-                if g.last_played:
-                    stamp = datetime.fromtimestamp(g.last_played).strftime("%Y-%m-%d %H:%M")
-                    detail += f"   |   last played {stamp}"
-                put(h - 3, 1, detail, curses.A_DIM)
-            put(h - 2, 1, message, curses.color_pair(3) if colors else 0)
-            help_txt = ("Type to search | Enter accept | Esc clear" if searching else
-                        "j/k move  / search  Tab source  s sort  Enter launch  q quit")
-            put(h - 1, 1, help_txt, curses.A_DIM)
+        draw_screen(put, w, h, T, G, state)
         stdscr.refresh()
 
-        # ---- input (wake up regularly while sizes are still being measured) ----
-        stdscr.timeout(300 if pending else -1)
+        # ---- input (wake up often while sizes are still being measured: spinner) ----
+        stdscr.timeout(100 if pending else 1000)
         try:
             key = stdscr.get_wch()
         except curses.error:
@@ -886,9 +1467,9 @@ def tui(stdscr, all_games, tracker, start_sort=0):
         elif key in (curses.KEY_DOWN, "j"):
             sel += 1
         elif key == curses.KEY_PPAGE:
-            sel -= max(1, list_h)
+            sel -= list_h
         elif key == curses.KEY_NPAGE:
-            sel += max(1, list_h)
+            sel += list_h
         elif key in (curses.KEY_HOME, "g"):
             sel = 0
         elif key in (curses.KEY_END, "G"):
@@ -897,36 +1478,28 @@ def tui(stdscr, all_games, tracker, start_sort=0):
             searching = True
         elif key == "\x1b":
             query, sel, top = "", 0, 0
-        elif key in ("\t", "f"):
+        elif key in (curses.KEY_RIGHT, "l", "\t", "f"):
             src_i = (src_i + 1) % len(sources)
+            sel = top = 0
+        elif key in (curses.KEY_LEFT, "h", curses.KEY_BTAB):
+            src_i = (src_i - 1) % len(sources)
             sel = top = 0
         elif key == "s":
             sort_i = (sort_i + 1) % len(SORTS)
         elif key in ("\n", "\r", curses.KEY_ENTER) and view:
             g = view[sel]
-            track = tracker.applies_to(g)
-            try:
-                if g.terminal:
-                    token = tracker.begin(g) if track else None
-                    curses.endwin()
-                    try:
-                        subprocess.call(g.launch)
-                    finally:
-                        if token is not None:
-                            tracker.end(token)
-                        stdscr.refresh()
-                else:
-                    proc = subprocess.Popen(
-                        g.launch, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL, start_new_session=True)
-                    message = f"Launched {g.name}"
-                    if track:
-                        token = tracker.begin(g)
-                        threading.Thread(
-                            target=lambda p=proc, t=token: (p.wait(), tracker.end(t)),
-                            daemon=True).start()
-            except (OSError, subprocess.SubprocessError) as exc:
-                message = f"Could not launch {g.name}: {exc}"
+            message = play(g, tracker)   # the TUI is closed until the game quits
+            if g.source in ("steam", "non-steam", "lutris", "epic", "gog"):
+                time.sleep(2)            # let the launcher save playtime
+            current_source = sources[src_i]
+            all_games[:] = refresh_games(all_games, tracker)
+            sources = source_list(all_games)
+            src_i = sources.index(current_source) if current_source in sources else 0
+            reselect = (g.source, g.name)
+            fingerprint, last_rescan, dirty = watch_fingerprint(), time.time(), False
+            stdscr.clear()               # redraw the TUI
+            stdscr.refresh()
+            curses.flushinp()            # drop keys pressed while the game was running
 
 
 # --------------------------------------------------------------------------- #
@@ -965,6 +1538,10 @@ def main():
         return
 
     os.environ.setdefault("ESCDELAY", "25")
+    try:
+        locale.setlocale(locale.LC_ALL, "")   # lets curses draw unicode
+    except locale.Error:
+        pass
     try:
         curses.wrapper(tui, games, tracker, SORTS.index(args.sort))
     finally:

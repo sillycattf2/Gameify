@@ -48,7 +48,7 @@ Requires Python 3.8+ and nothing else.
 
 | Source | Where |
 |---|---|
-| Steam | Native and Flatpak installs, every library folder |
+| Steam | Native and Flatpak installs, every library folder, plus games you added with "Add a Non-Steam Game" (shown as `non-steam`) |
 | Lutris | Installed games (native and Flatpak) |
 | Heroic | Epic and GOG games |
 | Desktop entries | Anything in the "Game" category: native, Flatpak, Snap |
@@ -77,9 +77,9 @@ gameify --sort recent  # name | source | size | playtime | recent
 | `↑` `↓` / `j` `k` | Move |
 | `PgUp` `PgDn`, `g` `G` | Page, top / bottom |
 | `/` | Search (`Esc` clears) |
-| `Tab` | Cycle source filter |
+| `Tab` / `←` `→` | Switch source tab |
 | `s` | Cycle sort: name / source / size / playtime / recent |
-| `Enter` | Launch |
+| `Enter` | Launch. gameify closes while you play and reopens when you quit the game |
 | `q` | Quit |
 
 ## How sizes are measured
@@ -97,7 +97,7 @@ Wine prefixes, save files and shared runtimes are not included.
 
 | Source | Where the numbers come from |
 |---|---|
-| Steam | Steam's local files (`localconfig.vdf` and the game's manifest). Steam updates these when a game closes, so a game you're playing right now won't have counted yet. |
+| Steam | Steam's local files (`localconfig.vdf` and the game's manifest). Steam saves these on its own schedule, so the numbers can lag behind a game you just played. |
 | Lutris | Lutris's own database |
 | Heroic (Epic, GOG) | Heroic's playtime records (best effort, depends on your Heroic version) |
 | Native, Flatpak, Snap | Nothing tracks these, so gameify times the sessions you start **from inside gameify** (press `Enter`) and saves them to `~/.local/share/gameify/playtime.json` |
@@ -108,3 +108,26 @@ Notes on the last row:
 - If you quit gameify while a game is running, the time so far is saved.
 
 On narrow terminals the right-hand columns are hidden to keep game names readable (last played goes first).
+
+## What happens when you launch a game
+
+Press `Enter` and gameify clears the screen, starts the game, and waits. When you close the game, gameify comes back on its own with the list refreshed, so playtime and last played are up to date. Press `Ctrl+C` while waiting to come back right away (the game keeps running).
+
+How it knows the game has closed:
+
+| Source | How |
+|---|---|
+| Native, Flatpak, Snap | It waits for the program it started. A game that starts a separate launcher and exits straight away will make gameify come back early. |
+| Steam, non-Steam | It watches for Steam's game process (`SteamLaunch AppId=...`). |
+| Lutris | It watches for Lutris's `lutris-wrapper` process. |
+| Heroic (Epic, GOG) | Best effort: it watches for Heroic's `launch <game>` process. |
+
+If gameify can't see a launcher's game start within 3 minutes, it comes back and says so. If it has no way to watch a game at all, it asks you to press `Enter` when you're done.
+
+## Stays up to date
+
+gameify updates itself while it's open. Install a game (or remove one) and the list changes within a few seconds, with a note like `New: Hades` at the bottom. Your selection stays where it was. The green `● live` in the corner shows it's watching.
+
+It watches Steam's library and manifests, your non-Steam shortcuts, Lutris and Heroic's records, and the app menu folders (native, Flatpak and Snap). A Steam game appears once its download finishes, not while it's still downloading.
+
+Games you delete by hand outside any launcher (for example, removing a folder) are noticed the next time something else changes, or when you restart gameify.
