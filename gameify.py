@@ -926,12 +926,12 @@ CHROME_ROWS = 11   # screen rows used by everything except the game rows
 
 GLYPHS_UNICODE = dict(
     tl="╭", tr="╮", bl="╰", br="╯", h="─", v="│", ml="├", mr="┤",
-    full="█", empty="░", dot="●", pointer="›", up="▲", down="▼", sep="·", thumb="┃",
+    full="█", empty="░", dot="●", na="·", pointer="›", up="▲", down="▼", sep="·", thumb="┃",
     cursor="▏", more_l="‹", more_r="›", ellipsis="…", logo="◆",
     enter="⏎", updown="↑↓", leftright="←→", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 GLYPHS_ASCII = dict(
     tl="+", tr="+", bl="+", br="+", h="-", v="|", ml="+", mr="+",
-    full="#", empty=".", dot="*", pointer=">", up="^", down="v", sep="-", thumb="#",
+    full="#", empty=".", dot="*", na=".", pointer=">", up="^", down="v", sep="-", thumb="#",
     cursor="_", more_l="<", more_r=">", ellipsis="~", logo="*",
     enter="Enter", updown="j/k", leftright="h/l", spinner="|/-\\")
 
@@ -952,10 +952,10 @@ COLOR_IDS = {"black": 0, "red": 1, "green": 2, "yellow": 3,
              "blue": 4, "magenta": 5, "cyan": 6, "white": 7}
 
 
-def workshop_text(g):
-    """Workshop cell text: only Steam games have a Workshop, so everything else stays blank."""
+def workshop_text(g, not_applicable=""):
+    """Workshop cell text. Only Steam games have a Workshop; others get `not_applicable`."""
     if g.source != "steam":
-        return ""
+        return not_applicable
     return human_size(g.workshop_size) if g.workshop_size else "-"
 
 
@@ -1056,7 +1056,7 @@ def cell_parts(g, key, width, bars, max_size, T, G):
         return [(fit(fmt_playtime(g.playtime_seconds), width, ">", G["ellipsis"]),
                  T["base"] if g.playtime_seconds else T["dim"])]
     if key == "workshop":
-        return [(fit(workshop_text(g), width, ">", G["ellipsis"]),
+        return [(fit(workshop_text(g, G["na"]), width, ">", G["ellipsis"]),
                  T["base"] if g.workshop_size else T["dim"])]
     text = fmt_last_played(g.last_played)
     attr = T["dim"] if text == "-" else T["good"] if text in ("today", "yesterday") else T["base"]
