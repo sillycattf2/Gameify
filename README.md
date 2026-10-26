@@ -85,6 +85,7 @@ gameify --sort recent  # name | source | size | playtime | recent
 ## How sizes are measured
 
 - **Steam:** the size Steam reports in its manifest.
+- **Steam Workshop:** the games that have Workshop items get a WORKSHOP column with the space those items use (the total Steam reports, or the folder size if Steam has no record). It isn't included in the SIZE column. The total at the top and the details line at the bottom add the two together.
 - **Lutris, Heroic, GOG:** disk usage of the game's install folder.
 - **Flatpak:** disk usage of the app itself (shared runtimes are not counted).
 - **Snap:** size of the installed `.snap` image.
@@ -131,3 +132,9 @@ gameify updates itself while it's open. Install a game (or remove one) and the l
 It watches Steam's library and manifests, your non-Steam shortcuts, Lutris and Heroic's records, and the app menu folders (native, Flatpak and Snap). A Steam game appears once its download finishes, not while it's still downloading.
 
 Games you delete by hand outside any launcher (for example, removing a folder) are noticed the next time something else changes, or when you restart gameify.
+
+## Colors
+
+gameify uses your terminal's own color palette, so it follows whatever theme you use (Dracula, Gruvbox, Solarized, Nord, light or dark). It never sets fixed colors of its own. Change your terminal theme and gameify changes with it.
+
+On terminals with no color support it falls back to bold, dim and reversed text, and in a plain ASCII locale it uses simple characters instead of box-drawing symbols.

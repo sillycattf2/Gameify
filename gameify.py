@@ -66,6 +66,7 @@ class Game:
     install_dir: str = ""        # folder to measure, if known
     app_id: str = ""             # flatpak / snap id, if any
     size: Optional[int] = None   # bytes. None = still calculating, 0 = unknown
+    workshop_size: int = 0       # bytes used by Steam Workshop items for this game
     playtime_seconds: int = 0    # 0 = none / unknown
     last_played: int = 0         # unix timestamp, 0 = never / unknown
     terminal: bool = False       # needs to run inside the terminal
@@ -525,6 +526,24 @@ def steam_libraries():
     return libraries
 
 
+def workshop_size_for(libraries, appid):
+    """Disk space used by a game's Steam Workshop items (0 if it has none)."""
+    total = 0
+    for lib in libraries:
+        kv = {}
+        for k, v in KV.findall(read_text(lib / "workshop" / f"appworkshop_{appid}.acf")):
+            kv.setdefault(k, v)
+        try:
+            size = int(kv.get("SizeOnDisk", "0"))   # the total Steam itself reports
+        except ValueError:
+            size = 0
+        content = lib / "workshop" / "content" / appid
+        if not size and content.is_dir():            # no usable manifest: measure the folder
+            size = dir_size(content)
+        total += size
+    return total
+
+
 def scan_steam():
     libraries = steam_libraries()
 
@@ -560,6 +579,7 @@ def scan_steam():
             folder = str(lib / "common" / kv.get("installdir", ""))
             games.append(Game(
                 name=name, source="steam", size=size, app_id=appid,
+                workshop_size=workshop_size_for(libraries, appid),
                 path=folder, install_dir=folder,
                 playtime_seconds=minutes * 60, last_played=max(last, manifest_last),
                 launch=base + [f"steam://rungameid/{appid}"],
@@ -845,6 +865,7 @@ def watch_paths():
     paths = []
     for lib in steam_libraries():
         paths += [lib, lib / "libraryfolders.vdf"] + sorted(lib.glob("appmanifest_*.acf"))
+        paths += [lib / "workshop"] + sorted(lib.glob("workshop/appworkshop_*.acf"))
     for root in STEAM_ROOTS:
         paths += sorted(root.glob("userdata/*/config/shortcuts.vdf"))
     for db, _games_dir in LUTRIS_SOURCES:
@@ -905,7 +926,7 @@ CHROME_ROWS = 11   # screen rows used by everything except the game rows
 
 GLYPHS_UNICODE = dict(
     tl="╭", tr="╮", bl="╰", br="╯", h="─", v="│", ml="├", mr="┤",
-    full="█", empty="░", dot="●", pointer="▌", up="▲", down="▼", sep="·", thumb="┃",
+    full="█", empty="░", dot="●", pointer="›", up="▲", down="▼", sep="·", thumb="┃",
     cursor="▏", more_l="‹", more_r="›", ellipsis="…", logo="◆",
     enter="⏎", updown="↑↓", leftright="←→", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 GLYPHS_ASCII = dict(
@@ -914,9 +935,21 @@ GLYPHS_ASCII = dict(
     cursor="_", more_l="<", more_r=">", ellipsis="~", logo="*",
     enter="Enter", updown="j/k", leftright="h/l", spinner="|/-\\")
 
-THEME_KEYS = (["base", "dim", "border", "accent", "accent_b", "pill", "good", "warn", "bad",
-               "hot", "sel", "sel_b", "sel_accent", "keycap"]
-              + ["src:" + s for s in SOURCE_ORDER])
+# Every colour role is a terminal palette colour *name* plus style flags (b=bold, d=dim,
+# r=reverse), never a fixed RGB value, so the terminal's theme decides what they look like.
+THEME_SPEC = {
+    "base": (None, ""), "dim": (None, "d"), "border": (None, "d"),
+    "accent": ("cyan", ""), "accent_b": ("cyan", "b"),
+    "pill": ("cyan", "rb"), "keycap": (None, "r"),
+    "sel": ("cyan", "r"), "sel_b": ("cyan", "rb"), "sel_accent": ("cyan", "rb"),
+    "good": ("green", ""), "warn": ("yellow", ""), "bad": ("red", ""), "hot": ("yellow", "b"),
+    "src:steam": ("blue", "b"), "src:non-steam": ("cyan", "b"), "src:lutris": ("yellow", "b"),
+    "src:epic": (None, "b"), "src:gog": ("magenta", "b"), "src:flatpak": ("green", "b"),
+    "src:snap": ("red", "b"), "src:native": (None, ""),
+}
+THEME_KEYS = list(THEME_SPEC)
+COLOR_IDS = {"black": 0, "red": 1, "green": 2, "yellow": 3,
+             "blue": 4, "magenta": 5, "cyan": 6, "white": 7}
 
 
 def source_name(source):
@@ -938,66 +971,56 @@ def fit(text, width, align="<", ellipsis="~"):
 
 
 def make_theme():
-    """Curses attributes for every colour role (256 colours when available)."""
-    T = dict.fromkeys(THEME_KEYS, 0)
-    T.update(dim=curses.A_DIM, border=curses.A_DIM, accent=curses.A_BOLD, accent_b=curses.A_BOLD,
-             pill=curses.A_REVERSE | curses.A_BOLD, sel=curses.A_REVERSE,
-             sel_b=curses.A_REVERSE | curses.A_BOLD, sel_accent=curses.A_REVERSE | curses.A_BOLD,
-             keycap=curses.A_REVERSE)
-    if not curses.has_colors():
-        return T
-    curses.start_color()
-    curses.use_default_colors()
-    count = [0]
+    """Curses attributes for every colour role. Colours are the terminal's own palette
+    (the 8 base ANSI colours and its default text / background), so they follow its theme."""
+    colors = curses.has_colors()
+    if colors:
+        curses.start_color()
+        curses.use_default_colors()
+    pairs = {}
 
-    def pair(fg, bg=-1):
-        count[0] += 1
-        curses.init_pair(count[0], fg, bg)
-        return curses.color_pair(count[0])
+    def attr_for(color, flags):
+        attr = 0
+        if "b" in flags:
+            attr |= curses.A_BOLD
+        if "d" in flags:
+            attr |= curses.A_DIM
+        if "r" in flags:
+            attr |= curses.A_REVERSE
+        if colors and color:
+            if color not in pairs:
+                pairs[color] = len(pairs) + 1
+                curses.init_pair(pairs[color], COLOR_IDS[color], -1)   # -1 = terminal default bg
+            attr |= curses.color_pair(pairs[color])
+        return attr
 
-    C = curses
-    if curses.COLORS >= 256:
-        T.update(dim=pair(245), border=pair(240), accent=pair(75), accent_b=pair(75) | C.A_BOLD,
-                 pill=pair(16, 75) | C.A_BOLD, good=pair(114), warn=pair(221), bad=pair(203),
-                 hot=pair(209), sel=pair(255, 24), sel_b=pair(255, 24) | C.A_BOLD,
-                 sel_accent=pair(117, 24) | C.A_BOLD, keycap=pair(16, 252))
-        palette = {"steam": 75, "non-steam": 117, "lutris": 214, "epic": 250,
-                   "gog": 141, "flatpak": 114, "snap": 211, "native": 180}
-    else:
-        T.update(accent=pair(C.COLOR_CYAN), accent_b=pair(C.COLOR_CYAN) | C.A_BOLD,
-                 pill=pair(C.COLOR_BLACK, C.COLOR_CYAN) | C.A_BOLD, good=pair(C.COLOR_GREEN),
-                 warn=pair(C.COLOR_YELLOW), bad=pair(C.COLOR_RED),
-                 hot=pair(C.COLOR_YELLOW) | C.A_BOLD, sel=pair(C.COLOR_BLACK, C.COLOR_CYAN),
-                 sel_b=pair(C.COLOR_BLACK, C.COLOR_CYAN) | C.A_BOLD,
-                 sel_accent=pair(C.COLOR_BLACK, C.COLOR_CYAN) | C.A_BOLD,
-                 keycap=pair(C.COLOR_BLACK, C.COLOR_WHITE))
-        palette = {"steam": C.COLOR_CYAN, "non-steam": C.COLOR_BLUE, "lutris": C.COLOR_YELLOW,
-                   "epic": C.COLOR_WHITE, "gog": C.COLOR_MAGENTA, "flatpak": C.COLOR_GREEN,
-                   "snap": C.COLOR_RED, "native": C.COLOR_WHITE}
-    for source, colour in palette.items():
-        T["src:" + source] = pair(colour)
-    return T
+    return {role: attr_for(*spec) for role, spec in THEME_SPEC.items()}
 
 
-def pick_columns(inner):
+def pick_columns(inner, workshop=False):
     """Choose the columns that fit: (columns, name width, show size bars)."""
     def make(bars):
-        return [("source", "SOURCE", 11, "<"),
-                ("size", "SIZE", BAR_W + 10 if bars else 9, "<" if bars else ">"),
-                ("played", "PLAYED", 8, ">"),
-                ("last", "LAST PLAYED", 13, "<")]
+        every = {"source": ("source", "SOURCE", 11, "<"),
+                 "size": ("size", "SIZE", BAR_W + 10 if bars else 9, "<" if bars else ">"),
+                 "workshop": ("workshop", "WORKSHOP", 9, ">"),
+                 "played": ("played", "PLAYED", 8, ">"),
+                 "last": ("last", "LAST PLAYED", 13, "<")}
+        order = ["source", "size"] + (["workshop"] if workshop else []) + ["played", "last"]
+        return {key: every[key] for key in order}
 
     def name_width(cols):
-        return inner - 4 - sum(2 + c[2] for c in cols)
+        return inner - 4 - sum(2 + c[2] for c in cols.values())
 
     for bars, need in ((True, 26), (False, 18)):
         cols = make(bars)
         if name_width(cols) >= need:
-            return cols, name_width(cols), bars
+            return list(cols.values()), name_width(cols), bars
     cols = make(False)
-    while cols and name_width(cols) < 18:
-        cols.pop()
-    return cols, name_width(cols), False
+    for key in ("last", "played", "workshop", "size", "source"):   # least important first
+        if name_width(cols) >= 18:
+            break
+        cols.pop(key, None)
+    return list(cols.values()), name_width(cols), False
 
 
 def cell_parts(g, key, width, bars, max_size, T, G):
@@ -1019,6 +1042,9 @@ def cell_parts(g, key, width, bars, max_size, T, G):
     if key == "played":
         return [(fit(fmt_playtime(g.playtime_seconds), width, ">", G["ellipsis"]),
                  T["base"] if g.playtime_seconds else T["dim"])]
+    if key == "workshop":
+        text = human_size(g.workshop_size) if g.workshop_size else "-"
+        return [(fit(text, width, ">", G["ellipsis"]), T["base"] if g.workshop_size else T["dim"])]
     text = fmt_last_played(g.last_played)
     attr = T["dim"] if text == "-" else T["good"] if text in ("today", "yesterday") else T["base"]
     return [(fit(text, width, "<", G["ellipsis"]), attr)]
@@ -1110,7 +1136,7 @@ def draw_screen(put, w, h, T, G, st):
         segs(2, W - sort_w - 1, sort_parts)
 
     # ---- the table: rounded box, header, rows, scrollbar ----
-    cols, name_w, bars = pick_columns(inner)
+    cols, name_w, bars = pick_columns(inner, st["has_workshop"])
     y0 = 3
     put(y0, 0, G["tl"] + G["h"] * inner + G["tr"], border)
     put(y0 + 2, 0, G["ml"] + G["h"] * inner + G["mr"], border)
@@ -1183,6 +1209,8 @@ def draw_screen(put, w, h, T, G, st):
             size_txt = f"{human_size(g.size)} on disk"
         else:
             size_txt = "size unknown"
+        if g.workshop_size:
+            size_txt += f" + {human_size(g.workshop_size)} workshop"
         play_txt = (f"{fmt_playtime(g.playtime_seconds)} played" if g.playtime_seconds
                     else "no playtime recorded")
         if g.last_played:
@@ -1426,7 +1454,8 @@ def tui(stdscr, all_games, tracker, start_sort=0):
             view=view, sel=sel, top=top, sources=sources, src_i=src_i, counts=counts,
             sort=SORTS[sort_i], query=query, searching=searching, message=message,
             pending=pending, frame=int(time.time() * 10), all_count=len(all_games),
-            total_size=sum(g.size or 0 for g in view),
+            has_workshop=any(g.workshop_size for g in all_games),
+            total_size=sum((g.size or 0) + g.workshop_size for g in view),
             total_play=sum(g.playtime_seconds for g in view))
         stdscr.erase()
         draw_screen(put, w, h, T, G, state)
@@ -1528,12 +1557,15 @@ def main():
         if args.json:
             print(json.dumps([asdict(g) for g in games], indent=2))
             return
-        print(f"{'NAME':<40} {'SOURCE':<8} {'SIZE':>9} {'PLAYED':>9}  LAST PLAYED")
+        ws = any(g.workshop_size for g in games)
+        print(f"{'NAME':<40} {'SOURCE':<9} {'SIZE':>9} " + (f"{'WORKSHOP':>9} " if ws else "")
+              + f"{'PLAYED':>9}  LAST PLAYED")
         for g in games:
-            print(f"{g.name[:40]:<40} {g.source:<8} {human_size(g.size):>9} "
-                  f"{fmt_playtime(g.playtime_seconds):>9}  {fmt_last_played(g.last_played)}")
-        print(f"\n{len(games)} games found, "
-              f"{human_size(sum(g.size or 0 for g in games))} used, "
+            print(f"{g.name[:40]:<40} {g.source:<9} {human_size(g.size):>9} "
+                  + (f"{human_size(g.workshop_size):>9} " if ws else "")
+                  + f"{fmt_playtime(g.playtime_seconds):>9}  {fmt_last_played(g.last_played)}")
+        total = sum((g.size or 0) + g.workshop_size for g in games)
+        print(f"\n{len(games)} games found, {human_size(total)} used, "
               f"{fmt_playtime(sum(g.playtime_seconds for g in games))} played")
         return
 
