@@ -85,7 +85,7 @@ gameify --sort recent  # name | source | size | playtime | recent
 ## How sizes are measured
 
 - **Steam:** the size Steam reports in its manifest.
-- **Steam Workshop:** the games that have Workshop items get a WORKSHOP column with the space those items use (the total Steam reports, or the folder size if Steam has no record). It isn't included in the SIZE column. The total at the top and the details line at the bottom add the two together.
+- **Steam Workshop:** the Steam games that have Workshop items get a WORKSHOP column (it only appears on tabs that contain such a game, and only Steam games show a value) with the space those items use (the total Steam reports, or the folder size if Steam has no record). It isn't included in the SIZE column. The total at the top and the details line at the bottom add the two together.
 - **Lutris, Heroic, GOG:** disk usage of the game's install folder.
 - **Flatpak:** disk usage of the app itself (shared runtimes are not counted).
 - **Snap:** size of the installed `.snap` image.

@@ -952,6 +952,19 @@ COLOR_IDS = {"black": 0, "red": 1, "green": 2, "yellow": 3,
              "blue": 4, "magenta": 5, "cyan": 6, "white": 7}
 
 
+def workshop_text(g):
+    """Workshop cell text: only Steam games have a Workshop, so everything else stays blank."""
+    if g.source != "steam":
+        return ""
+    return human_size(g.workshop_size) if g.workshop_size else "-"
+
+
+def show_workshop(all_games, sources, src_i):
+    """Show the WORKSHOP column only on tabs that contain a Steam game with Workshop items."""
+    pool = all_games if sources[src_i] == "all" else [g for g in all_games if g.source == sources[src_i]]
+    return any(g.source == "steam" and g.workshop_size for g in pool)
+
+
 def source_name(source):
     return SOURCE_NAMES.get(source, source.title())
 
@@ -1043,8 +1056,8 @@ def cell_parts(g, key, width, bars, max_size, T, G):
         return [(fit(fmt_playtime(g.playtime_seconds), width, ">", G["ellipsis"]),
                  T["base"] if g.playtime_seconds else T["dim"])]
     if key == "workshop":
-        text = human_size(g.workshop_size) if g.workshop_size else "-"
-        return [(fit(text, width, ">", G["ellipsis"]), T["base"] if g.workshop_size else T["dim"])]
+        return [(fit(workshop_text(g), width, ">", G["ellipsis"]),
+                 T["base"] if g.workshop_size else T["dim"])]
     text = fmt_last_played(g.last_played)
     attr = T["dim"] if text == "-" else T["good"] if text in ("today", "yesterday") else T["base"]
     return [(fit(text, width, "<", G["ellipsis"]), attr)]
@@ -1209,7 +1222,7 @@ def draw_screen(put, w, h, T, G, st):
             size_txt = f"{human_size(g.size)} on disk"
         else:
             size_txt = "size unknown"
-        if g.workshop_size:
+        if g.source == "steam" and g.workshop_size:
             size_txt += f" + {human_size(g.workshop_size)} workshop"
         play_txt = (f"{fmt_playtime(g.playtime_seconds)} played" if g.playtime_seconds
                     else "no playtime recorded")
@@ -1454,7 +1467,7 @@ def tui(stdscr, all_games, tracker, start_sort=0):
             view=view, sel=sel, top=top, sources=sources, src_i=src_i, counts=counts,
             sort=SORTS[sort_i], query=query, searching=searching, message=message,
             pending=pending, frame=int(time.time() * 10), all_count=len(all_games),
-            has_workshop=any(g.workshop_size for g in all_games),
+            has_workshop=show_workshop(all_games, sources, src_i),
             total_size=sum((g.size or 0) + g.workshop_size for g in view),
             total_play=sum(g.playtime_seconds for g in view))
         stdscr.erase()
@@ -1557,12 +1570,12 @@ def main():
         if args.json:
             print(json.dumps([asdict(g) for g in games], indent=2))
             return
-        ws = any(g.workshop_size for g in games)
+        ws = any(g.source == "steam" and g.workshop_size for g in games)
         print(f"{'NAME':<40} {'SOURCE':<9} {'SIZE':>9} " + (f"{'WORKSHOP':>9} " if ws else "")
               + f"{'PLAYED':>9}  LAST PLAYED")
         for g in games:
             print(f"{g.name[:40]:<40} {g.source:<9} {human_size(g.size):>9} "
-                  + (f"{human_size(g.workshop_size):>9} " if ws else "")
+                  + (f"{workshop_text(g):>9} " if ws else "")
                   + f"{fmt_playtime(g.playtime_seconds):>9}  {fmt_last_played(g.last_played)}")
         total = sum((g.size or 0) + g.workshop_size for g in games)
         print(f"\n{len(games)} games found, {human_size(total)} used, "
